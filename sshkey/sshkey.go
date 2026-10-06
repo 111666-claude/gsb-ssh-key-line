@@ -11,10 +11,11 @@ import (
 
 // Key 是一条解析出来的公钥。
 type Key struct {
-	Algo    string `json:"algo"`
-	Bytes   int    `json:"bytes"`
-	Comment string `json:"comment"`
-	FP      string `json:"fp"`
+	Algo     string `json:"algo"`
+	Bytes    int    `json:"bytes"`
+	Comment  string `json:"comment"`
+	FP       string `json:"fp"`
+	material []byte
 }
 
 // Counter 记录本轮检查过的已解析条数。
@@ -38,11 +39,25 @@ func readField(blob []byte, off *int) ([]byte, error) {
 
 // Parse 解析一行公钥。
 func Parse(line string, c *Counter) (Key, error) {
-	parts := strings.Fields(line)
-	if len(parts) < 2 {
+	rest := strings.TrimLeft(line, " \t")
+	algoEnd := strings.IndexAny(rest, " \t")
+	if algoEnd < 0 {
 		return Key{}, errors.New("bad-line")
 	}
-	blob, err := base64.StdEncoding.DecodeString(parts[1])
+	lineAlgo := rest[:algoEnd]
+	rest = strings.TrimLeft(rest[algoEnd:], " \t")
+	b64End := strings.IndexAny(rest, " \t")
+	var b64, comment string
+	if b64End < 0 {
+		b64 = rest
+	} else {
+		b64 = rest[:b64End]
+		comment = strings.TrimLeft(rest[b64End:], " \t")
+	}
+	if lineAlgo == "" || b64 == "" {
+		return Key{}, errors.New("bad-line")
+	}
+	blob, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		return Key{}, errors.New("bad-base64")
 	}
@@ -51,43 +66,44 @@ func Parse(line string, c *Counter) (Key, error) {
 	if err != nil {
 		return Key{}, err
 	}
+	if string(algo) != lineAlgo {
+		return Key{}, errors.New("algo-mismatch")
+	}
 	material, err := readField(blob, &off)
 	if err != nil {
 		return Key{}, err
 	}
-	comment := ""
-	if len(parts) > 2 {
-		comment = parts[2]
+	for off < len(blob) {
+		if _, err := readField(blob, &off); err != nil {
+			return Key{}, errors.New("trailing-bytes")
+		}
 	}
 	sum := 0
 	for _, b := range material {
 		sum = sum*31 + int(b)
 	}
 	return Key{
-		Algo:    string(algo),
-		Bytes:   len(material),
-		Comment: comment,
-		FP:      hex.EncodeToString([]byte{byte(sum), byte(sum >> 8)}),
+		Algo:     string(algo),
+		Bytes:    len(material),
+		Comment:  comment,
+		FP:       hex.EncodeToString([]byte{byte(sum), byte(sum >> 8)}),
+		material: material,
 	}, nil
 }
 
 // ParseMany 逐行解析并按指纹去重。
 func ParseMany(lines []string, c *Counter) []Key {
 	out := []Key{}
+	seen := make(map[string]struct{})
 	for _, line := range lines {
 		key, err := Parse(line, c)
 		if err != nil {
 			continue
 		}
-		dup := false
-		for _, seen := range out {
-			c.Scanned++
-			if seen.FP == key.FP && seen.Algo == key.Algo {
-				dup = true
-				break
-			}
-		}
-		if !dup {
+		c.Scanned++
+		id := key.Algo + "\x1f" + string(key.material)
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
 			out = append(out, key)
 		}
 	}
