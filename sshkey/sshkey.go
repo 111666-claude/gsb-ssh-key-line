@@ -15,6 +15,8 @@ type Key struct {
 	Bytes   int    `json:"bytes"`
 	Comment string `json:"comment"`
 	FP      string `json:"fp"`
+
+	material string
 }
 
 // Counter 记录本轮检查过的已解析条数。
@@ -28,7 +30,7 @@ func readField(blob []byte, off *int) ([]byte, error) {
 	}
 	n := int(binary.BigEndian.Uint32(blob[*off : *off+4]))
 	*off += 4
-	if n < 0 || *off+n > len(blob) {
+	if n < 0 || n > len(blob)-*off {
 		return nil, errors.New("truncated")
 	}
 	value := blob[*off : *off+n]
@@ -36,18 +38,42 @@ func readField(blob []byte, off *int) ([]byte, error) {
 	return value, nil
 }
 
+// splitLine 把一行拆成算法名、base64 密钥块和整段备注。
+func splitLine(line string) (algo, blob, comment string, err error) {
+	rest := strings.TrimLeft(line, " \t")
+	i := strings.IndexAny(rest, " \t")
+	if i < 0 {
+		return "", "", "", errors.New("bad-line")
+	}
+	algo = rest[:i]
+	rest = strings.TrimLeft(rest[i:], " \t")
+	j := strings.IndexAny(rest, " \t")
+	if j < 0 {
+		return algo, rest, "", nil
+	}
+	return algo, rest[:j], strings.TrimSpace(rest[j:]), nil
+}
+
+// decodeBase64 按标准字母表解码，允许末尾缺补齐。
+func decodeBase64(s string) ([]byte, error) {
+	if rem := len(s) % 4; rem != 0 {
+		s += strings.Repeat("=", 4-rem)
+	}
+	return base64.StdEncoding.DecodeString(s)
+}
+
 // Parse 解析一行公钥。
 func Parse(line string, c *Counter) (Key, error) {
-	parts := strings.Fields(line)
-	if len(parts) < 2 {
-		return Key{}, errors.New("bad-line")
+	algo, blob64, comment, err := splitLine(line)
+	if err != nil {
+		return Key{}, err
 	}
-	blob, err := base64.StdEncoding.DecodeString(parts[1])
+	blob, err := decodeBase64(blob64)
 	if err != nil {
 		return Key{}, errors.New("bad-base64")
 	}
 	off := 0
-	algo, err := readField(blob, &off)
+	algoField, err := readField(blob, &off)
 	if err != nil {
 		return Key{}, err
 	}
@@ -55,41 +81,41 @@ func Parse(line string, c *Counter) (Key, error) {
 	if err != nil {
 		return Key{}, err
 	}
-	comment := ""
-	if len(parts) > 2 {
-		comment = parts[2]
+	if off != len(blob) {
+		return Key{}, errors.New("trailing-bytes")
+	}
+	if string(algoField) != algo {
+		return Key{}, errors.New("algo-mismatch")
 	}
 	sum := 0
 	for _, b := range material {
 		sum = sum*31 + int(b)
 	}
 	return Key{
-		Algo:    string(algo),
-		Bytes:   len(material),
-		Comment: comment,
-		FP:      hex.EncodeToString([]byte{byte(sum), byte(sum >> 8)}),
+		Algo:     algo,
+		Bytes:    len(material),
+		Comment:  comment,
+		FP:       hex.EncodeToString([]byte{byte(sum), byte(sum >> 8)}),
+		material: string(material),
 	}, nil
 }
 
 // ParseMany 逐行解析并按指纹去重。
 func ParseMany(lines []string, c *Counter) []Key {
 	out := []Key{}
+	seen := map[string]struct{}{}
 	for _, line := range lines {
 		key, err := Parse(line, c)
 		if err != nil {
 			continue
 		}
-		dup := false
-		for _, seen := range out {
-			c.Scanned++
-			if seen.FP == key.FP && seen.Algo == key.Algo {
-				dup = true
-				break
-			}
+		c.Scanned++
+		id := key.Algo + "\x00" + key.material
+		if _, ok := seen[id]; ok {
+			continue
 		}
-		if !dup {
-			out = append(out, key)
-		}
+		seen[id] = struct{}{}
+		out = append(out, key)
 	}
 	return out
 }
